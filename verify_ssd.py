@@ -53,7 +53,10 @@ except ImportError:
 console = Console()
 
 # ── 参数 ──────────────────────────────────────────────────────────────
-CHUNK = 1 << 30          # 每个测试文件 1 GiB
+CHUNK = 1 << 30          # 默认块大小 1 GiB；实际按设备容量自适应，见 pick_chunk()
+CHUNK_MIN = 4 << 20      # 最小 4 MiB —— 再小则块头/哨兵占比过高
+CHUNK_MAX = 1 << 30      # 最大 1 GiB —— 再大则大盘上的文件数太少、曲线太粗
+TARGET_SAMPLES = 256     # 目标采样点数，决定速度曲线的分辨率
 HDR = 4096               # 块头，写唯一标识
 SENTINELS = 16           # 块内散布的哨兵数，把覆盖检测粒度降到 64 MiB
 SENT_LEN = 64
@@ -80,6 +83,22 @@ def _base() -> bytes:
     if _BASE is None:
         _BASE = np.random.default_rng(0xC0FFEE).bytes(BASE_LEN)
     return _BASE
+
+
+def pick_chunk(free_bytes: int) -> int:
+    """按设备容量挑块大小，保证小设备也能拿到足够的采样点。
+
+    块大小固定 1 GiB 的话，U 盘和 SD 卡上会废掉 —— 8GB 的卡只有 7 个点，
+    曲线没法看，512MB 的卡连一块都写不进去直接失败。而 U 盘/SD 卡恰恰是
+    扩容盘最泛滥的地方，正是最需要测的。
+
+    取 2 的幂便于对齐（FILE_FLAG_NO_BUFFERING 要求读长度是扇区整数倍）。
+    """
+    raw = max(free_bytes // TARGET_SAMPLES, 1)
+    p = CHUNK_MIN
+    while p * 2 <= raw and p < CHUNK_MAX:
+        p *= 2
+    return max(CHUNK_MIN, min(p, CHUNK_MAX))
 
 
 def _sentinel_offsets(size: int) -> list[int]:
@@ -362,6 +381,7 @@ class Result:
     started: str = ""
     written_bytes: int = 0
     planned_bytes: int = 0
+    chunk_bytes: int = CHUNK
     write_speeds: list = field(default_factory=list)
     read_speeds: list = field(default_factory=list)
     bad_blocks: list = field(default_factory=list)
@@ -391,6 +411,11 @@ class Result:
                 return i, before, after
         return None, 0.0, 0.0
 
+    def cache_bytes(self) -> int:
+        """SLC 缓存容量 = 拐点块号 × 块大小。"""
+        knee = self.cache_knee()[0]
+        return (knee or 0) * self.chunk_bytes
+
     def sustained(self) -> float:
         """尾段 20% 的平均写入，代表缓存耗尽后的真实持续写入能力。"""
         s = self.write_speeds
@@ -402,8 +427,10 @@ class Result:
 
 # ── 实时界面 ───────────────────────────────────────────────────────────
 class LiveView:
-    def __init__(self, dev: Device, mode: str, total_chunks: int):
+    def __init__(self, dev: Device, mode: str, total_chunks: int,
+                 chunk: int = CHUNK):
         self.dev, self.mode, self.total = dev, mode, total_chunks
+        self.chunk = chunk
         self.phase = "准备中"
         self.phase_no = 0
         self.done = 0
@@ -438,7 +465,7 @@ class LiveView:
         t.add_column()
         t.add_row("阶段", f"[bold yellow]{self.phase_no}/3　{self.phase}[/]")
         t.add_row("进度", f"{bar}  [bold]{self.done}/{self.total}[/]  {pct*100:5.1f}%")
-        t.add_row("已处理", f"{human(self.done * CHUNK)} / {human(self.total * CHUNK)}"
+        t.add_row("已处理", f"{human(self.done * self.chunk)} / {human(self.total * self.chunk)}"
                             f"　[bright_black]已用 {mmss(el)}　剩余约 {mmss(eta)}[/]")
         if self.speeds:
             cur, avg, pk = self.speeds[-1], statistics.fmean(self.speeds), max(self.speeds)
@@ -528,18 +555,20 @@ def run_test(dev: Device, mode: str, limit_gb: int = 0) -> Result:
         budget = min(QUICK_GB << 30, int(free * 0.9))
     else:
         budget = int(free * 0.98)          # 留 2% 给文件系统元数据
-    n = max(1, budget // CHUNK)
+    chunk = pick_chunk(free)
+    n = max(1, budget // chunk)
 
-    res = Result(device=asdict(dev), mode=mode, planned_bytes=n * CHUNK,
+    res = Result(device=asdict(dev), mode=mode, planned_bytes=n * chunk,
+                 chunk_bytes=chunk,
                  started=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    view = LiveView(dev, mode, n)
+    view = LiveView(dev, mode, n, chunk)
 
     with Live(view.render(), console=console, refresh_per_second=4) as live:
         view.phase, view.phase_no = "写入测试", 2
         t_start = time.time()
         try:
             for i in range(n):
-                data = make_chunk(i, CHUNK)          # 生成不计入耗时
+                data = make_chunk(i, chunk)          # 生成不计入耗时
                 p = work / f"chunk_{i:05d}.bin"
                 t0 = time.time()
                 with open(p, "wb", buffering=0) as f:
@@ -547,8 +576,8 @@ def run_test(dev: Device, mode: str, limit_gb: int = 0) -> Result:
                     f.flush()
                     os.fsync(f.fileno())             # 绕过系统缓存，测真实落盘
                 dt = max(time.time() - t0, 1e-6)
-                res.write_speeds.append(CHUNK / dt / (1 << 20))
-                res.written_bytes += CHUNK
+                res.write_speeds.append(chunk / dt / (1 << 20))
+                res.written_bytes += chunk
                 view.done = i + 1
                 view.speeds = res.write_speeds
                 live.update(view.render())
@@ -572,13 +601,13 @@ def run_test(dev: Device, mode: str, limit_gb: int = 0) -> Result:
                 continue
             t0 = time.time()
             try:
-                data = read_direct(p, CHUNK)       # 绕过系统缓存，测真实读盘速度
+                data = read_direct(p, chunk)       # 绕过系统缓存，测真实读盘速度
             except OSError:
                 with open(p, "rb", buffering=0) as f:
                     data = f.read()                # 直读不可用时退回普通读
             dt = max(time.time() - t0, 1e-6)
             res.read_speeds.append(len(data) / dt / (1 << 20))
-            ok, why = verify_chunk(data, i, CHUNK)
+            ok, why = verify_chunk(data, i, chunk)
             if not ok:
                 res.bad_blocks.append({"idx": i, "why": why})
             view.done = i + 1
@@ -629,7 +658,7 @@ def build_advice(res: Result, dev: Device) -> tuple[str, str, list[str]]:
                    f"不适合直接在盘上跑程序或剪辑。")
 
     if knee_i is not None:
-        cache = knee_i * CHUNK
+        cache = res.cache_bytes()
         drop = (1 - after / before) * 100 if before else 0
         adv.append(f"SLC 缓存约 {human(cache)}，之后从 {before:.0f} 掉到 {after:.0f} MB/s"
                    f"（跌 {drop:.0f}%）。单次拷贝控制在 {human(cache)} 以内可全程跑满速。")
@@ -680,7 +709,9 @@ def show_report(res: Result, dev: Device) -> str:
             if dev.smart.get(k) is not None:
                 t1.add_row(cn, str(dev.smart[k]))
     else:
-        t1.add_row("SMART", "[bright_black]USB 桥接未透传（常见，不代表有问题）[/]")
+        why = ("USB 桥接芯片未透传（常见，不代表有问题）" if dev.bus == "USB"
+               else "系统未提供该设备的可靠性计数")
+        t1.add_row("SMART", f"[bright_black]{why}[/]")
 
     knee_i, before, after = res.cache_knee()
     t2 = Table(title="实测结果", border_style="cyan", title_style="bold")
@@ -702,7 +733,7 @@ def show_report(res: Result, dev: Device) -> str:
                "[green]良好[/]" if res.sustained() >= 150
                else "[yellow]偏低[/]" if res.sustained() >= 80 else "[red]很慢[/]")
     if knee_i is not None:
-        t2.add_row("SLC 缓存", human(knee_i * CHUNK),
+        t2.add_row("SLC 缓存", human(res.cache_bytes()),
                    f"[bright_black]拐点后 {before:.0f} → {after:.0f} MB/s[/]")
     else:
         t2.add_row("SLC 缓存", "未见拐点", "[bright_black]全程速度稳定[/]")
@@ -756,7 +787,7 @@ def plot(res: Result, dev: Device, path: Path) -> None:
     knee_i, before, after = res.cache_knee()
     if knee_i is not None:
         ax.axvline(knee_i, color="#dc2626", ls="--", lw=1.2)
-        ax.annotate(f"SLC 缓存耗尽 @ {human(knee_i*CHUNK)}\n{before:.0f} → {after:.0f} MB/s",
+        ax.annotate(f"SLC 缓存耗尽 @ {human(res.cache_bytes())}\n{before:.0f} → {after:.0f} MB/s",
                     xy=(knee_i, after),
                     xytext=(knee_i + len(res.write_speeds) * .06, before * .85),
                     color="#dc2626", fontsize=9,
